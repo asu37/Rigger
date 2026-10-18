@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "rigger"
+version = "1.2.0"
+name = "Rigger"
+tagline = "Modular auto-rigging, skinning, retargeting and game export"
+maintainer = "Rigger contributors"
+type = "add-on"
+
+tags = ["Rigging", "Animation"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "Read and write presets, rig data and FBX/glTF exports"
+network = "Download the optional AI marker model and onnxruntime, only when you click Install AI Model"

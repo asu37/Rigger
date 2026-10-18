@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+*.blend1
+gui_shots/
+bench/assets/
+bench/results/
