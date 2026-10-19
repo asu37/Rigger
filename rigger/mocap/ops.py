@@ -30,6 +30,15 @@ def cache_dir():
 
 class RiggerVideoSettings(bpy.types.PropertyGroup):
     filepath: StringProperty(name="Video", subtype='FILE_PATH', description="Video of one person (MP4, MOV, ...)")
+    filepath2: StringProperty(name="Second Camera", subtype='FILE_PATH',
+                              description="Optional: the same take filmed from another angle (ideally 60-90 degrees "
+                                          "around the person). Both are solved together, which removes most depth "
+                                          "guessing. The cameras are calibrated from the person, no board needed")
+    auto_sync: BoolProperty(name="Sync by Sound", default=True,
+                            description="Find the time offset between the two videos from their sound "
+                                        "(clap once at the start). Off: use Offset")
+    offset2: FloatProperty(name="Offset", default=0.0, unit='TIME_ABSOLUTE',
+                           description="Seconds the second video starts later than the first (negative: earlier)")
     motion_path: StringProperty(name="Motion File", subtype='FILE_PATH',
                                 description="Also save the solved motion here (.mcap) to reuse it on other rigs")
     focal_mm: FloatProperty(name="Focal Length", default=pipeline.DEFAULT_FOCAL_MM, min=8, max=300, unit='CAMERA',
@@ -46,6 +55,9 @@ class RiggerVideoSettings(bpy.types.PropertyGroup):
                              description="Steadier motion (higher) or quicker response (lower)")
     foot_lock: BoolProperty(name="Plant Feet", default=True,
                             description="Keep feet from sliding while they touch the floor and the body on the floor")
+    use_depth: BoolProperty(name="Depth Cues", default=False,
+                            description="Experimental: let a depth model judge which limb is nearer the camera "
+                                        "(needs the depth model in the AI folder; single camera only)")
     fingers: BoolProperty(name="Fingers", default=True, description="Animate the fingers")
     face: BoolProperty(name="Face", default=True,
                        description="Drive shape keys with ARKit names (eyeBlinkLeft, jawOpen, ...)")
@@ -61,7 +73,7 @@ def solver_settings(s):
     """UI smoothing 0..1 -> One-Euro settings (0.5 gives the defaults)."""
     k = 2.0 ** (1.0 - 2.0 * s.smoothing)   # 0 -> 2x cutoff, 1 -> 0.5x
     return {"min_cutoff": round(1.2 * k, 3), "beta": round(0.4 * k, 3), "foot_lock": bool(s.foot_lock),
-            "camera_tilt": float(s.camera_tilt)}
+            "camera_tilt": float(s.camera_tilt), "use_depth": bool(s.use_depth)}
 
 
 def _target_rig(context):
@@ -71,10 +83,11 @@ def _target_rig(context):
     return rig
 
 
-def apply_motion(context, rig, path, s, video=None):
+def apply_motion(context, rig, path, s, video=None, video2=None):
     meta, sk, arrays = schema.load(path)
     action = bake.bake(context, rig, meta, sk, arrays, start=context.scene.frame_start,
                        fingers=s.fingers, face=s.face, simplify=s.simplify, camera=s.camera, video=video,
+                       video2=video2,
                        name=f"{rig.name}_{os.path.splitext(os.path.basename(video or path))[0]}")
     return meta, action
 
@@ -104,6 +117,9 @@ class RIGGER_OT_video_to_animation(bpy.types.Operator):
         ready, message = ai_markers.status()
         if not ready:
             raise RiggerError(f"Pose model not ready: {message} (Rigger preferences > AI)")
+        video2 = bpy.path.abspath(s.filepath2) if s.filepath2 else None
+        if video2 and not os.path.isfile(video2):
+            raise RiggerError("The second camera's video was not found")
         rig = _target_rig(context)
         sk = skeleton.from_rig(rig)
         out = bpy.path.abspath(s.motion_path) if s.motion_path else os.path.join(
@@ -111,7 +127,8 @@ class RIGGER_OT_video_to_animation(bpy.types.Operator):
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         return rig, {"video": video, "skeleton": sk.to_dict(), "out": out, "focal_mm": s.focal_mm,
                      "start": s.start, "count": s.count or None, "max_side": s.max_side, "cache_dir": cache_dir(),
-                     "settings": solver_settings(s), "ai_dir": ai_markers.ai_dir()}
+                     "settings": solver_settings(s), "ai_dir": ai_markers.ai_dir(),
+                     "video2": video2, "offset2": None if (video2 and s.auto_sync) else s.offset2}
 
     def execute(self, context):
         rig, job = self._job(context)
@@ -119,8 +136,9 @@ class RIGGER_OT_video_to_animation(bpy.types.Operator):
         if self.wait or bpy.app.background:
             meta, _sk, _arr = pipeline.run(job["video"], job["skeleton"], out=job["out"], focal_mm=job["focal_mm"],
                                            start=job["start"], count=job["count"], max_side=job["max_side"],
-                                           cache_dir=job["cache_dir"], settings=job["settings"])
-            meta, action = apply_motion(context, rig, job["out"], s, job["video"])
+                                           cache_dir=job["cache_dir"], settings=job["settings"],
+                                           video2=job["video2"], offset2=job["offset2"])
+            meta, action = apply_motion(context, rig, job["out"], s, job["video"], job["video2"])
             self.report({'INFO'}, f"Animated {meta['frames']} frames onto '{rig.name}' ({action.name})")
             return {'FINISHED'}
         fd, job_path = tempfile.mkstemp(suffix=".json", prefix="rigger_video_")
@@ -171,9 +189,10 @@ class RIGGER_OT_video_to_animation(bpy.types.Operator):
         while not self._lines.empty():
             msg = self._lines.get()
             if "stage" in msg:
-                share = {"keypoints": (0.0, 0.8), "solve": (0.8, 0.1), "floor": (0.9, 0.1)}.get(msg["stage"], (0, 1))
+                share = {"keypoints": (0.0, 0.8), "keypoints 2": (0.0, 0.8), "solve": (0.8, 0.1),
+                         "floor": (0.9, 0.1)}.get(msg["stage"], (0.8, 0.1))
                 s.progress = share[0] + share[1] * msg["done"] / max(msg["total"], 1)
-                s.status = f"{'Reading the video' if msg['stage'] == 'keypoints' else 'Solving 3D'}: " \
+                s.status = f"{ {'keypoints': 'Reading the video', 'keypoints 2': 'Reading the second video'}.get(msg['stage'], 'Solving 3D')}: " \
                            f"{msg['done']}/{msg['total']}"
             elif "error" in msg:
                 self._error = msg["error"]
@@ -196,7 +215,7 @@ class RIGGER_OT_video_to_animation(bpy.types.Operator):
             self.report({'ERROR'}, "The rig was removed")
             return {'CANCELLED'}
         try:
-            meta, action = apply_motion(context, rig, done, s, self._job_data["video"])
+            meta, action = apply_motion(context, rig, done, s, self._job_data["video"], self._job_data["video2"])
         except (ValueError, RiggerError) as exc:
             s.status = f"Failed: {exc}"
             self.report({'ERROR'}, s.status)
@@ -229,6 +248,61 @@ class RIGGER_OT_video_apply(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
 
 
+class RIGGER_OT_import_freemocap(bpy.types.Operator, ImportHelper):
+    """Animate the rig from a FreeMoCap recording (choose any file in its output_data folder)"""
+    bl_idname = "rigger.import_freemocap"
+    bl_label = "Import FreeMoCap"
+    bl_options = {'REGISTER', 'UNDO'}
+    filter_glob: StringProperty(default="*.npy;*.csv", options={'HIDDEN'})
+    fps: FloatProperty(name="Frame Rate", default=30.0, min=1.0, max=240.0,
+                       description="Frame rate of the recording (FreeMoCap does not store it in its output)")
+
+    @classmethod
+    def poll(cls, context):
+        return utils.find_rig_for(context.object) is not None
+
+    def execute(self, context):
+        from . import freemocap
+        rig = _target_rig(context)
+        s = context.scene.rigger_video
+        sk = skeleton.from_rig(rig)
+        try:
+            meta, arrays = freemocap.solve(sk, self.filepath, fps=self.fps, settings=solver_settings(s))
+        except ValueError as exc:
+            raise RiggerError(str(exc)) from None
+        name = os.path.basename(os.path.dirname(os.path.dirname(self.filepath))) or "freemocap"
+        out = bpy.path.abspath(s.motion_path) if s.motion_path else os.path.join(
+            cache_dir(), f"{name}_{sk.signature()}.mcap")
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        schema.save(out, meta, sk.to_dict(), arrays)
+        meta, action = apply_motion(context, rig, out, s)
+        self.report({'INFO'}, f"Animated {meta['frames']} frames from FreeMoCap onto '{rig.name}' ({action.name})")
+        return {'FINISHED'}
+
+
+class RIGGER_OT_install_depth_model(bpy.types.Operator):
+    """Download the Depth Anything V2 Small model (about 50 MB, Apache-2.0) for the experimental Depth Cues.
+Blender waits until the download is done"""
+    bl_idname = "rigger.install_depth_model"
+    bl_label = "Install Depth Model"
+
+    def execute(self, context):
+        from . import depth
+        if not getattr(bpy.app, "online_access", True):
+            raise RiggerError("Online access is disabled (Preferences > System > Network). Allow it, or copy "
+                              f"{depth.MODEL_FILE} into {ai_markers.ai_dir()}")
+        os.makedirs(ai_markers.ai_dir(), exist_ok=True)
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        try:
+            ai_markers._download(depth.MODEL_URL, depth.model_path(), depth.MODEL_SHA256,
+                                 lambda f: wm.progress_update(int(f * 100)))
+        finally:
+            wm.progress_end()
+        self.report({'INFO'}, f"Depth model installed in {ai_markers.ai_dir()}")
+        return {'FINISHED'}
+
+
 class RIGGER_PT_video(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -245,6 +319,14 @@ class RIGGER_PT_video(bpy.types.Panel):
         s = context.scene.rigger_video
         layout = self.layout
         layout.prop(s, "filepath", text="")
+        row = layout.row(align=True)
+        row.prop(s, "filepath2", text="2nd")
+        if s.filepath2:
+            row = layout.row(align=True)
+            row.prop(s, "auto_sync", toggle=True)
+            sub = row.row(align=True)
+            sub.enabled = not s.auto_sync
+            sub.prop(s, "offset2")
         col = layout.column(align=True)
         col.prop(s, "focal_mm")
         col.prop(s, "camera_tilt")
@@ -259,6 +341,13 @@ class RIGGER_PT_video(bpy.types.Panel):
         row.prop(s, "camera", toggle=True)
         sub = layout.column(align=True)
         sub.prop(s, "simplify")
+        if not s.filepath2:
+            row = sub.row(align=True)
+            row.prop(s, "use_depth")
+            if s.use_depth:
+                from . import depth
+                if not depth.available():
+                    row.operator("rigger.install_depth_model", text="", icon='IMPORT')
         sub.prop(s, "motion_path", text="Save")
         ready, message = ai_markers.status()
         if not ready:
@@ -272,10 +361,13 @@ class RIGGER_PT_video(bpy.types.Panel):
                 layout.label(text="Esc cancels", icon='INFO')
             else:
                 layout.label(text=s.status, icon='INFO')
-        layout.operator("rigger.video_apply", icon='IMPORT')
+        row = layout.row(align=True)
+        row.operator("rigger.video_apply", icon='IMPORT')
+        row.operator("rigger.import_freemocap", icon='IMPORT')
 
 
-classes = (RiggerVideoSettings, RIGGER_OT_video_to_animation, RIGGER_OT_video_apply, RIGGER_PT_video)
+classes = (RiggerVideoSettings, RIGGER_OT_video_to_animation, RIGGER_OT_video_apply, RIGGER_OT_import_freemocap,
+           RIGGER_OT_install_depth_model, RIGGER_PT_video)
 
 
 def register_props():

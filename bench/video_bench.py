@@ -6,7 +6,8 @@ video-to-animation pipeline is scored against the exact motion it came from.
     blender -b --factory-startup --python bench/video_bench.py -- make --body realistic_male [--out DIR]
     blender -b --factory-startup --python bench/video_bench.py -- eval --body realistic_male [--focal 26] [--out DIR]
 
-make writes DIR/clip.mp4 and DIR/truth.npz; eval writes DIR/report_<focal>.json/.md.
+eval --two scores the two-camera solve (needs both clips). make writes DIR/clip.mp4 and DIR/truth.npz (with --view side: clip_side.mp4, truth_side.npz, the
+second camera of two-camera runs); eval writes DIR/report_<focal>.json/.md.
 Scores (lower is better): joint error with the root aligned (MPJPE) and after
 the best rigid alignment (PA-MPJPE), limb angle error, root path error, jitter
 against the true motion, foot sliding during true contacts, finger curl error,
@@ -38,6 +39,9 @@ RES = (432, 768)
 FOCAL_MM = 35.0
 CAM_POS = (0.0, -3.7, 1.0)
 CAM_PITCH = 6.0     # degrees down
+SIDE_ANGLE = 70.0   # the second camera of two-camera clips: turned this far around the character (to its left)
+VIEW = "front"      # "side" renders the second camera (make --view side)
+TWO = False         # eval --two: solve from both cameras
 
 # Beats of the performance: frame -> parameters (degrees, metres). Unlisted parameters are 0.
 # arm: elevation (-90 down .. 90 up), azimuth (0 out to the side, 90 forward); thigh: pitch forward, abduction
@@ -157,7 +161,15 @@ def camera_matrix():
     M = np.eye(4)
     M[:3, :3] = R
     M[:3, 3] = CAM_POS
+    if VIEW == "side":
+        turn = np.eye(4)
+        turn[:3, :3] = np.array(Matrix.Rotation(np.radians(SIDE_ANGLE), 3, 'Z'))
+        M = turn @ M
     return M
+
+
+def suffix():
+    return "" if VIEW == "front" else "_" + VIEW
 
 
 def to_camera(points, M):
@@ -225,7 +237,7 @@ def make(name, out):
     r.resolution_percentage = 100
     r.fps = FPS
     scene.view_settings.view_transform = 'Standard'
-    frames_dir = os.path.join(out, "frames")
+    frames_dir = os.path.join(out, "frames" + suffix())
     os.makedirs(frames_dir, exist_ok=True)
     r.image_settings.file_format = 'PNG'
     r.filepath = os.path.join(frames_dir, "f_")
@@ -239,10 +251,10 @@ def make(name, out):
     for n, pts in S.items():
         c = to_camera(pts, M)
         sites_px[n] = np.stack([f_px * c[:, 0] / c[:, 2] + RES[0] / 2, f_px * c[:, 1] / c[:, 2] + RES[1] / 2], axis=1)
-    np.savez(os.path.join(out, "truth.npz"), theta=theta, root_R=root_R, root_t=root_t, P=P, cam=M,
+    np.savez(os.path.join(out, f"truth{suffix()}.npz"), theta=theta, root_R=root_R, root_t=root_t, P=P, cam=M,
              skeleton=np.array(sk.dumps()), site_names=np.array(list(sites_px)),
              sites_px=np.stack(list(sites_px.values()), axis=1))
-    encode(frames_dir, os.path.join(out, "clip.mp4"))
+    encode(frames_dir, os.path.join(out, f"clip{suffix()}.mp4"))
 
 
 def encode(frames_dir, path):
@@ -366,6 +378,20 @@ def score(sk, truth, meta, arrays, seen):
     }
 
 
+def calibration_error(truth, truth_side, meta):
+    """Solved second-camera pose vs the true one: rotation (deg) and position (m) of camera 2 seen from camera 1."""
+    D = np.diag([1, -1, -1])
+    Ma, Mb = truth["cam"], truth_side["cam"]
+    R_true = D @ Mb[:3, :3].T @ Ma[:3, :3] @ D
+    t_true = D @ Mb[:3, :3].T @ (Ma[:3, 3] - Mb[:3, 3])
+    cal = meta.get("calibration", {})
+    true_angle = float(np.degrees(np.arccos(np.clip((np.trace(R_true) - 1) / 2, -1, 1))))
+    true_base = float(np.linalg.norm(-R_true.T @ t_true))
+    return {"angle_solved": cal.get("angle_deg"), "angle_true": round(true_angle, 2),
+            "baseline_solved": cal.get("baseline_m"), "baseline_true": round(true_base, 3),
+            "agreement": cal.get("agreement")}
+
+
 def local_theta(sk, local_q):
     L = bake.quat_to_matrix(local_q)
     B = sk.frames
@@ -379,14 +405,21 @@ def evaluate(name, out, focal, settings):
     _body, rig = build_body(name)
     sk_solve = from_rig(rig)   # today's site model; the joints are the truth's
     t0 = time.time()
-    seen = pipeline.perceive(os.path.join(out, "clip.mp4"), cache_dir=os.path.join(out, "cache"))
+    seen = pipeline.perceive(os.path.join(out, "clip.mp4"), cache_dir=os.path.join(out, "cache"),
+                             depth=bool(settings.get("use_depth", False)) and not TWO)
     t_kp = time.time() - t0
-    meta, arrays = pipeline.solve(sk_solve, seen, focal_mm=focal, settings=settings)
+    second = None
+    if TWO:
+        seen2 = pipeline.perceive(os.path.join(out, "clip_side.mp4"), cache_dir=os.path.join(out, "cache"))
+        second = {"seen": seen2, "focal_mm": focal, "offset": 0.0, "source": "clip_side.mp4"}
+    meta, arrays = pipeline.solve(sk_solve, seen, focal_mm=focal, settings=settings, second=second)
     result = score(sk, truth, meta, arrays, seen)
+    if TWO:
+        result["calibration"] = calibration_error(truth, dict(np.load(os.path.join(out, "truth_side.npz"))), meta)
     result["keypoint_seconds"] = round(t_kp, 1) if not seen.get("cached") else "cached"
     result["focal_mm"] = focal
     result["settings"] = settings
-    tag = f"{focal:g}" + ("_" + "_".join(f"{k}{v}" for k, v in sorted(settings.items())) if settings else "")
+    tag = ("two_" if TWO else "") + f"{focal:g}" + ("_" + "_".join(f"{k}{v}" for k, v in sorted(settings.items())) if settings else "")
     with open(os.path.join(out, f"report_{tag}.json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=1)
     print("RESULT", json.dumps(result))
@@ -401,6 +434,9 @@ def main():
     os.environ.setdefault("RIGGER_AI_DIR", os.path.join(HERE, "assets", "ai"))
     bpy.ops.wm.read_factory_settings(use_empty=True)
     rigger.register()
+    global VIEW, TWO
+    VIEW = arg("--view", "front")
+    TWO = "--two" in ARGS
     name = arg("--body", "realistic_male")
     out = os.path.abspath(arg("--out", os.path.join(HERE, "results", "video", name)))
     if ARGS and ARGS[0] == "make":

@@ -185,3 +185,31 @@ floor height, backward-swing limits at hips and shoulders, a second pass that
 holds planted feet on the floor plane, and IK foot locking. The woman's sliding
 comes from one-frame touches at the bottom of the squat; her remaining error is
 mostly the right elbow while both arms point straight at the camera.
+
+### Two cameras
+
+`make --view side` renders the same performance from a second camera 70 degrees
+around the character (`clip_side.mp4`, `truth_side.npz`); `eval --two` solves
+from both and also scores the self-calibration against the true camera.
+
+Solved from the 26 mm default (true lens 35 mm), focal length found automatically:
+
+| | man, 1 camera | man, 2 cameras | woman, 1 camera | woman, 2 cameras |
+| --- | --- | --- | --- | --- |
+| MPJPE (root aligned) | 57.5 mm | 39.0 mm | 68.5 mm | 36.3 mm |
+| PA-MPJPE | 42.5 mm | 17.8 mm | 50.4 mm | 25.5 mm |
+| second camera angle (true 70°) | | 71.6° | | 66.3° |
+| foot sliding in contacts | 0.8 cm/s | 0.0 | 8.2 cm/s | 0.0 |
+
+With the focal length given, the calibration lands within 0.2° (69.8° and 70.2°).
+Aligning two separately solved skeletons only got within about 12°; what works
+is refining that first guess by the epipolar (Sampson) error of the keypoints
+both cameras see. A closed-form essential matrix (8-point) is unstable here
+because a person a few metres away is nearly flat in depth.
+
+### Depth cues (not used by default)
+
+Depth Anything V2 Small read at the keypoints, as near/far ordering constraints:
+on the man's clip only 56-73% of its near/far calls were right (legs worst; the
+floor's perspective reads as depth) and PA-MPJPE went from 42.5 to 45.7 mm. The
+option stays, off by default, for real footage.

@@ -17,4 +17,4 @@ license = [
 
 [permissions]
 files = "Read and write presets, rig data and FBX/glTF exports"
-network = "Download the optional AI marker model and onnxruntime, only when you click Install AI Model"
+network = "Download the optional pose model, onnxruntime and depth model, only when you click an Install button"

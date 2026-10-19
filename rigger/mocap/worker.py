@@ -39,7 +39,8 @@ def main():
         meta, _sk, _arrays = pipeline.run(job["video"], job["skeleton"], out=job["out"], focal_mm=job["focal_mm"],
                                           start=job.get("start", 0), count=job.get("count"),
                                           max_side=job.get("max_side", 1280), cache_dir=job.get("cache_dir"),
-                                          settings=job.get("settings"), progress=progress)
+                                          settings=job.get("settings"), progress=progress,
+                                          video2=job.get("video2"), offset2=job.get("offset2"))
         say(done_file=job["out"], frames=meta["frames"], found=meta["found"])
     except Exception as exc:  # reported to the operator, which shows it to the user
         say(error=str(exc) or type(exc).__name__, trace=traceback.format_exc())

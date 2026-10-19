@@ -424,6 +424,22 @@ uploaded: it runs on your computer with the same pose model as AI Markers
 | Simplify | Remove keys that the tolerance can rebuild (0 keeps one key per frame) |
 | Save | Also save the solved motion (`.mcap`); **Apply Motion File** puts it on any other Rigger rig |
 
+**Two cameras (much more accurate).** Film the same take with a second phone
+about 60-90 degrees around the person, and set it as **2nd**. Clap once at the
+start: **Sync by Sound** lines the videos up from their sound (or turn it off and
+type the **Offset** in seconds). No calibration board is needed: the cameras are
+calibrated from the person, and the focal length is found automatically. Depth
+no longer has to be guessed, so arms pointing at a camera and deep bends come out
+right; a second **VideoCamera 2** with its own video is added for checking.
+
+**FreeMoCap.** **Import FreeMoCap** reads a FreeMoCap recording (choose any file
+in its `output_data` folder: the `mediapipe_*_3d_xyz` .npy or .csv files, version
+1.x or 2.x; set its frame rate) and fits the rig to it the same way.
+
+**Depth Cues (experimental, off).** With one camera, a depth model can judge
+which limb is nearer (install it with the button next to the option). On our
+test clips it did not help, so it is off by default.
+
 Tips: the whole body should stay in the picture, the camera should not move,
 and loose clothing hides the joints. Keypoints are cached per video, so a second
 run (other settings, another character) only re-solves.
@@ -435,7 +451,10 @@ view cannot show). A second pass holds planted feet on the floor found in the
 first, then the motion is smoothed without lag, contacts are detected, and every
 control gets its rotation change from rest. Single-camera capture cannot tell an
 arm pointing straight at the camera from a bent one in every case: check such
-moments and fix them with a few keys.
+moments and fix them with a few keys, or add a second camera. With two cameras
+the second camera's position comes from the keypoints both see (epipolar
+geometry, refined from a first guess) and its scale from the character's bone
+lengths; the skeleton is then fitted to both videos at once.
 
 ---
 

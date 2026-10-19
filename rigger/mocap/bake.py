@@ -142,7 +142,7 @@ def _write(fc, frames, values):
 
 
 def bake(context, rig, meta, skeleton, arrays, start=1, fingers=True, face=True, simplify=0.0,
-         set_scene=True, camera=False, video=None, name=None):
+         set_scene=True, camera=False, video=None, name=None, video2=None):
     """Key the motion on a new action. Returns the action."""
     sk_src = Skeleton.from_dict(skeleton)
     basis, loc, torso = solve_controls(rig, sk_src, arrays)
@@ -177,6 +177,8 @@ def bake(context, rig, meta, skeleton, arrays, start=1, fingers=True, face=True,
         scene.frame_start, scene.frame_end = int(start), int(start + F - 1)
     if camera and "camera_K" in arrays:
         make_camera(context, rig, meta, arrays, sk_src, start, video)
+        if "camera2_K" in arrays:   # second camera of a two-camera solve
+            make_camera(context, rig, meta, arrays, sk_src, start, video2, second=True)
     return action
 
 
@@ -219,22 +221,24 @@ def bake_face(rig, names, values, frames):
 # Camera matching the video
 # ---------------------------------------------------------------------------
 
-def make_camera(context, rig, meta, arrays, sk_src, start, video=None):
-    f, cx, cy = (float(v) for v in arrays["camera_K"])
-    w, h = meta["image_size"]
-    W = np.asarray(arrays["camera_W"])
+def make_camera(context, rig, meta, arrays, sk_src, start, video=None, second=False):
+    key = "camera2" if second else "camera"
+    f, cx, cy = (float(v) for v in arrays[key + "_K"])
+    w, h = meta["image_size2" if second else "image_size"]
+    W = np.asarray(arrays[key + "_W"])
     tgt = from_rig(rig)
     root_j = tgt.parents.index(-1)
     scale = tgt.rest[root_j][2] / max(sk_src.rest[sk_src.parents.index(-1)][2], 1e-6)
-    pos = np.asarray(arrays["camera_pos"]) * scale + np.array((tgt.rest[root_j][0], tgt.rest[root_j][1], 0.0))
+    pos = np.asarray(arrays[key + "_pos"]) * scale + np.array((tgt.rest[root_j][0], tgt.rest[root_j][1], 0.0))
     from mathutils import Matrix
-    cam_data = bpy.data.cameras.new("VideoCamera")
+    name = "VideoCamera 2" if second else "VideoCamera"
+    cam_data = bpy.data.cameras.new(name)
     cam_data.sensor_fit = 'HORIZONTAL'
     cam_data.sensor_width = 36.0
     cam_data.lens = f * 36.0 / w
     cam_data.shift_x = (cx - w / 2) / w
     cam_data.shift_y = -(cy - h / 2) / w
-    cam = bpy.data.objects.new("VideoCamera", cam_data)
+    cam = bpy.data.objects.new(name, cam_data)
     context.scene.collection.objects.link(cam)
     axes = np.column_stack([W[:, 0], -W[:, 1], -W[:, 2]])
     m = Matrix.Identity(4)
@@ -243,8 +247,9 @@ def make_camera(context, rig, meta, arrays, sk_src, start, video=None):
             m[r][c] = axes[r, c]
         m[r][3] = pos[r]
     cam.matrix_world = rig.matrix_world @ m
-    context.scene.render.resolution_x, context.scene.render.resolution_y = int(w), int(h)
-    context.scene.camera = cam
+    if not second:
+        context.scene.render.resolution_x, context.scene.render.resolution_y = int(w), int(h)
+        context.scene.camera = cam
     if video:
         try:
             clip = bpy.data.movieclips.load(video, check_existing=True)
@@ -252,7 +257,7 @@ def make_camera(context, rig, meta, arrays, sk_src, start, video=None):
             bg.source = 'MOVIE_CLIP'
             bg.clip = clip
             bg.alpha = 0.7
-            clip.frame_start = int(start)
+            clip.frame_start = int(start) - (int(round(meta.get("offset2", 0.0) * meta["fps"])) if second else 0)
             cam_data.show_background_images = True
         except RuntimeError:
             pass

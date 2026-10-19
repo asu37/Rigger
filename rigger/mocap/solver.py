@@ -33,6 +33,8 @@ DEFAULTS = {
     "temporal_rot": 0.35,   # radians per frame at 30 fps between frames
     "temporal_pos": 0.12,   # metres per frame at 30 fps (times the height / 1.8)
     "floor_sigma": 0.012,   # planted feet: allowed distance from the floor, in heights
+    "depth_margin": 0.01,   # depth model: a nearer/farther pair must differ by this share of the height...
+    "depth_sigma": 0.03,    # ...and a violation costs this much
     "floor_pass": True,     # second pass with planted feet held on the floor
     "level_camera": "auto",  # True: camera level (tilted camera_tilt degrees down); False: up from the body;
     "camera_tilt": 0.0,      # "auto": from the body unless that is over max_tilt_error degrees off level
@@ -157,12 +159,17 @@ def levenberg_marquardt(residual, x0, iterations, eps=1e-5, reweight=None):
 # ---------------------------------------------------------------------------
 
 class FrameFitter:
-    """Fits the body (root + all non-finger joints), then each hand's fingers."""
+    """Fits the body (root + all non-finger joints), then each hand's fingers.
 
-    def __init__(self, sk, cam, cfg=None):
+    views: extra cameras as (cam, R, t) mapping this camera's coordinates to theirs
+    (X_view = R @ X + t). Keypoints are then (cameras, 133, 2), the first being this camera."""
+
+    def __init__(self, sk, cam, cfg=None, views=None):
         self.sk = sk
         self.cam = cam
         self.cfg = _settings(cfg)
+        self.views = [(cam, np.eye(3), np.zeros(3))] + [(c, np.asarray(R, float), np.asarray(t, float))
+                                                        for c, R, t in (views or [])]
         sites = kp_sites()
         self.site_kp = {name: k for k, name in sites.items()}
         finger_roles = ("finger1", "finger", "thumb")
@@ -190,6 +197,7 @@ class FrameFitter:
         self.hinge = sk.hinge[self.body_joints]
         self.n = n
         self.floor_now = None
+        self.depth_now = None
         self.foot_sites = {side: [i for i, name in enumerate(self.body.site_names)
                                   if name.split(".")[0] in ("heel", "big_toe", "small_toe") and name.endswith(side)]
                            for side in ("L", "R")}
@@ -204,7 +212,25 @@ class FrameFitter:
                     self.reach.append((ia, ib, self.body.par[ia], limit))
 
     # -- body ----------------------------------------------------------------
-    def _body_residual(self, uv, w, sigma, prev, Rref):
+    def _observations(self, kp, sc, idx):
+        """Per camera: (uv, base weights, pixel sigma, person height) for the keypoints idx."""
+        kp, sc = np.asarray(kp, float), np.asarray(sc, float)
+        if kp.ndim == 2:
+            kp, sc = kp[None], sc[None]
+        out = []
+        for v in range(len(self.views)):
+            conf = sc[v, idx]
+            w0 = np.where(conf >= self.cfg["min_score"], conf, 0.0)
+            good = kp[v, np.where(sc[v, :23] >= self.cfg["min_score"])[0]]
+            person_h = max(np.ptp(good[:, 1]) if len(good) > 1 else 100.0, 30.0)
+            out.append((kp[v, idx], w0, self.cfg["px_sigma"] * person_h, person_h))
+        return out
+
+    def _project_views(self, S):
+        """Sites (N,s,3) in this camera -> pixel positions (N,s,2) in every camera."""
+        return [project(S if v == 0 else S @ R.T + t, cam) for v, (cam, R, t) in enumerate(self.views)]
+
+    def _body_residual(self, obs, weights, prev, Rref):
         cfg = self.cfg
         n = self.n
         hinge_idx = np.nonzero(self.hinge)[0]
@@ -218,8 +244,10 @@ class FrameFitter:
             Rr = rotvec_to_matrix(X[:, 3:6]) @ Rref
             theta = X[:, 6:].reshape(N, n, 3)
             G, P, S = self.body.forward(Rr, t, theta)
-            proj = (project(S, self.cam) - uv) * (np.sqrt(w)[:, None] / sigma)
-            parts = [proj.reshape(N, -1), ((theta - self.mean) / self.std).reshape(N, -1) * cfg["prior"]]
+            parts = []
+            for (uv, _w0, sigma, _h), w, proj in zip(obs, weights, self._project_views(S)):
+                parts.append(((proj - uv) * (np.sqrt(w)[:, None] / sigma)).reshape(N, -1))
+            parts.append(((theta - self.mean) / self.std).reshape(N, -1) * cfg["prior"])
             for ia, ib, par, limit in self.reach:
                 Gp = Rr if par < 0 else G[:, par]
                 d = P[:, ib] - P[:, ia]
@@ -231,6 +259,11 @@ class FrameFitter:
             if self.floor_now is not None:  # planted feet on the floor plane found by the first pass
                 up, level, idx = self.floor_now
                 parts.append((S[:, idx] @ up - level) / (cfg["floor_sigma"] * self.sk.height))
+            if self.depth_now is not None:  # which part is nearer the camera, from the depth model
+                pairs, sign, weight = self.depth_now
+                dz = S[:, pairs[:, 0], 2] - S[:, pairs[:, 1], 2]   # > 0: the first is farther away
+                gap = cfg["depth_margin"] * self.sk.height
+                parts.append(np.maximum(gap - dz * sign, 0) * weight / (cfg["depth_sigma"] * self.sk.height))
             if prev is not None:
                 parts.append(((theta - prev["theta_body"]) / (cfg["temporal_rot"] / fps_k)).reshape(N, -1))
                 parts.append(X[:, 3:6] / (cfg["temporal_rot"] / fps_k))
@@ -239,25 +272,24 @@ class FrameFitter:
         return residual
 
     def fit_body(self, kp, sc, init, prev=None, iterations=None):
-        """kp (133,2), sc (133,); init/prev: dict t, R, theta_body. Returns (state, cost per keypoint)."""
+        """kp (133,2) or (cameras,133,2), sc likewise; init/prev: dict t, R, theta_body.
+        Returns (state, cost)."""
         cfg = self.cfg
-        uv = kp[self.body_kp]
-        conf = sc[self.body_kp]
-        w0 = np.where(conf >= cfg["min_score"], conf, 0.0)
-        good = kp[np.where(sc[:23] >= cfg["min_score"])[0]]
-        person_h = max(np.ptp(good[:, 1]) if len(good) > 1 else 100.0, 30.0)
-        sigma = cfg["px_sigma"] * person_h
-        w = w0.copy()
+        obs = self._observations(kp, sc, self.body_kp)
+        weights = [o[1].copy() for o in obs]
         Rref = init["R"]
         residual_core = None
 
+        def sites(x):
+            return self.body.forward((rotvec_to_matrix(x[3:6]) @ Rref)[None], x[None, :3],
+                                     x[None, 6:].reshape(1, self.n, 3))[2]
+
         def reweight(x):
             nonlocal residual_core
-            _G, _P, S = self.body.forward((rotvec_to_matrix(x[3:6]) @ Rref)[None], x[None, :3],
-                                          x[None, 6:].reshape(1, self.n, 3))
-            err = np.linalg.norm(project(S[0], self.cam) - uv, axis=1) / sigma
-            w[:] = w0 / (1 + (err / cfg["cauchy"]) ** 2)
-            residual_core = self._body_residual(uv, w, sigma, prev, Rref)
+            for (uv, w0, sigma, _h), w, proj in zip(obs, weights, self._project_views(sites(x))):
+                err = np.linalg.norm(proj[0] - uv, axis=1) / sigma
+                w[:] = w0 / (1 + (err / cfg["cauchy"]) ** 2)
+            residual_core = self._body_residual(obs, weights, prev, Rref)
 
         def residual(X):
             return residual_core(X)
@@ -266,18 +298,28 @@ class FrameFitter:
         x, cost = levenberg_marquardt(residual, x0, iterations or cfg["iterations"], reweight=reweight)
         state = {"t": x[:3], "R": rotvec_to_matrix(x[3:6]) @ Rref, "theta_body": x[6:].reshape(self.n, 3)}
         _G, _P, S = self.body.forward(state["R"][None], state["t"][None], state["theta_body"][None])
-        err = np.linalg.norm(project(S[0], self.cam) - uv, axis=1)
-        used = w0 > 0
-        state["reproj"] = float(np.sum(err[used] * w0[used]) / max(np.sum(w0[used]), 1e-6) / person_h)
-        state["sigma"] = sigma
-        r = self._body_residual(uv, w, sigma, None, state["R"])(
+        total, wsum = 0.0, 0.0
+        for (uv, w0, _sigma, person_h), proj in zip(obs, self._project_views(S)):
+            used = w0 > 0
+            err = np.linalg.norm(proj[0] - uv, axis=1)
+            total += float(np.sum(err[used] * w0[used]) / person_h)
+            wsum += float(np.sum(w0[used]))
+        state["reproj"] = total / max(wsum, 1e-6)
+        state["sigma"] = obs[0][2]
+        r = self._body_residual(obs, weights, None, state["R"])(
             np.concatenate([state["t"], np.zeros(3), state["theta_body"].ravel()])[None])[0]
         state["fit_cost"] = float(r @ r)
         return state, cost
 
     def initial_guesses(self, kp, sc):
-        """Root position from the torso's pixel size, four headings."""
-        f, cx, cy = self.cam
+        """Root position from the torso's pixel size in the camera that sees the person best,
+        four headings; returned in the first camera's coordinates."""
+        kp, sc = np.asarray(kp, float), np.asarray(sc, float)
+        if kp.ndim == 2:
+            kp, sc = kp[None], sc[None]
+        v = int(np.argmax([np.mean(sc[i, :17]) for i in range(len(self.views))]))
+        (f, cx, cy), Rv, tv = self.views[v]
+        kp, sc = kp[v], sc[v]
         sk = self.sk
         ok = sc >= self.cfg["min_score"]
 
@@ -302,32 +344,39 @@ class FrameFitter:
         facing = 0.0
         if ok[5] and ok[6]:
             facing = 0.0 if kp[5][0] > kp[6][0] else np.pi
-        theta = self.mean.copy()
-        return [{"t": t.copy(), "R": R_FACING @ _yaw(facing + d), "theta_body": theta.copy()}
-                for d in (0.0, 0.6, -0.6, np.pi)]
+        out = []
+        for d in (0.0, 0.6, -0.6, np.pi):
+            R = R_FACING @ _yaw(facing + d)
+            out.append({"t": Rv.T @ (t - tv), "R": Rv.T @ R, "theta_body": self.mean.copy()})
+        return out
+
+    def enough(self, sc):
+        """A person is seen well enough in at least one camera."""
+        sc = np.asarray(sc)
+        sc = sc[None] if sc.ndim == 1 else sc
+        return any(np.sum(sc[v, :23] >= self.cfg["min_score"]) >= 6 for v in range(len(sc)))
 
     # -- hands ---------------------------------------------------------------
-    def fit_hand(self, side, kp, sc, Gb, pb, theta0, prev_theta, sigma):
+    def fit_hand(self, side, kp, sc, Gb, pb, theta0, prev_theta):
         cfg = self.cfg
-        h, chain = self.hands[side]
+        _h, chain = self.hands[side]
         kps = np.array([self.site_kp[s] for s in chain.site_names])
-        uv, conf = kp[kps], sc[kps]
-        w = np.where(conf >= cfg["min_score"], conf, 0.0)
-        if w.sum() < 3:
+        obs = self._observations(kp, sc, kps)
+        if sum(o[1].sum() for o in obs) < 3:
             return theta0
         J = chain.joints
         mean, std, hinge = self.sk.prior_mean[J], self.sk.prior_std[J], self.sk.hinge[J]
         hidx = np.nonzero(hinge)[0]
         n = len(J)
         fps_k = 30.0 / max(cfg.get("fps", 30.0), 1.0)
-        hsigma = sigma * 0.6
 
         def residual(X):
             N = X.shape[0]
             theta = X.reshape(N, n, 3)
             _G, _P, S = chain.forward(np.broadcast_to(Gb, (N, 3, 3)), np.broadcast_to(pb, (N, 3)), theta)
-            parts = [((project(S, self.cam) - uv) * (np.sqrt(w)[:, None] / hsigma)).reshape(N, -1),
-                     ((theta - mean) / std).reshape(N, -1)]
+            parts = [((proj - uv) * (np.sqrt(w0)[:, None] / (sig * 0.6))).reshape(N, -1)
+                     for (uv, w0, sig, _hh), proj in zip(obs, self._project_views(S))]
+            parts.append(((theta - mean) / std).reshape(N, -1))
             if len(hidx):
                 parts.append(np.maximum(-theta[:, hidx, 0] * hinge[hidx], 0) / 0.05)
             if prev_theta is not None:
@@ -341,16 +390,20 @@ class FrameFitter:
 # A whole clip
 # ---------------------------------------------------------------------------
 
-def solve_sequence(sk, kp, sc, cam, fps, cfg=None, progress=None, floor=None, reverse=False):
+def solve_sequence(sk, kp, sc, cam, fps, cfg=None, progress=None, floor=None, reverse=False, views=None,
+                   depth=None):
     """kp (F,133,2) pixels, sc (F,133) -> dict of camera-space results:
     t (F,3), R (F,3,3) root rotation rig->camera, theta (F,J,3) bone-frame rotvecs, valid (F,), reproj (F,).
 
     floor: optional dict(up, level, contacts (F,2)) in camera space from a first pass (see ground):
     feet in contact are then held on that plane, which settles leg depth and the root height.
-    reverse: solve from the last frame back to the first (for experiments)."""
+    reverse: solve from the last frame back to the first (for experiments).
+    views: extra cameras (see FrameFitter); kp and sc are then (F, cameras, 133, 2) and (F, cameras, 133).
+    depth: optional per-frame nearer/farther pairs from the depth model (see depth.py), or None."""
     cfg = _settings(cfg)
     cfg["fps"] = fps
-    fitter = FrameFitter(sk, cam, cfg)
+    fitter = FrameFitter(sk, cam, cfg, views)
+    kp_site = {int(k): i for i, k in enumerate(fitter.body_kp)}   # keypoint index -> body site index
     F, J = len(kp), len(sk.joints)
     out_t = np.zeros((F, 3))
     out_R = np.tile(np.eye(3), (F, 1, 1))
@@ -362,8 +415,7 @@ def solve_sequence(sk, kp, sc, cam, fps, cfg=None, progress=None, floor=None, re
     last = None
     bad_run = 0
     for n_done, f in enumerate(range(F - 1, -1, -1) if reverse else range(F)):
-        enough = np.sum(sc[f, :23] >= cfg["min_score"]) >= 6
-        if not enough:
+        if not fitter.enough(sc[f]):
             bad_run += 1
             if bad_run > fps:  # lost for over a second: start over when the person comes back
                 prev = None
@@ -379,6 +431,12 @@ def solve_sequence(sk, kp, sc, cam, fps, cfg=None, progress=None, floor=None, re
             idx = [i for k, side in enumerate(("L", "R")) if floor["contacts"][f, k] for i in fitter.foot_sites[side]]
             if idx:
                 fitter.floor_now = (floor["up"], floor["level"], idx)
+        fitter.depth_now = None
+        if depth is not None and depth[f]:
+            pairs = [(kp_site[a], kp_site[b], sg, w) for a, b, sg, w in depth[f] if a in kp_site and b in kp_site]
+            if pairs:
+                arr = np.array(pairs)
+                fitter.depth_now = (arr[:, :2].astype(int), arr[:, 2], arr[:, 3])
         if prev is None:
             best = None
             for guess in fitter.initial_guesses(kp[f], sc[f]):
@@ -403,7 +461,7 @@ def solve_sequence(sk, kp, sc, cam, fps, cfg=None, progress=None, floor=None, re
                 had = last is not None and valid[last]
                 t0 = theta[last, chain.joints] if had else sk.prior_mean[chain.joints]
                 theta[f, chain.joints] = fitter.fit_hand(side, kp[f], sc[f], G[0, k], P[0, k], t0.copy(),
-                                                         t0 if had else None, state["sigma"])
+                                                         t0 if had else None)
         valid[f] = True
         reproj[f] = state["reproj"]
         fit_costs[f] = state["fit_cost"]
@@ -478,7 +536,7 @@ def _foot_names(sk, side):
     return [n for n in (f"heel.{side}", f"big_toe.{side}", f"small_toe.{side}", f"toe_end.{side}") if n in sk.sites]
 
 
-def ground(sk, sol, fps, cfg=None):
+def ground(sk, sol, fps, cfg=None, views=None):
     """Camera-space solution -> world (Z up, camera looking along +Y, floor at Z=0).
 
     Returns dict: root_t (F,3) world pelvis position, root_R (F,3,3) world root rotation
@@ -542,6 +600,9 @@ def ground(sk, sol, fps, cfg=None):
     level = float(np.median(lows_cam[contacts])) if contacts.any() else float(floor)
     out = {"root_t": root_t, "root_R": root_R, "theta": theta, "W": W, "cam_pos": to_world(np.zeros(3)),
            "floor_cam": {"up": up, "level": level, "contacts": contacts.copy()},
+           # extra cameras (X_view = R @ X + t): camera->world rotation and position
+           "views_W": [W @ R.T for _c, R, _t in (views or [])],
+           "views_pos": [to_world(-R.T @ t) for _c, R, t in (views or [])],
            "contacts": contacts, "valid": sol["valid"], "floor_offset": 0.0}
     if cfg["foot_lock"]:
         plant(sk, out, fps)
@@ -602,6 +663,7 @@ def plant(sk, world, fps):
     world["floor_offset"] = float(np.mean(dz))
     # the camera moves with the average correction, so the body still lines up with the video
     world["cam_pos"] = world["cam_pos"] + delta.mean(axis=0)
+    world["views_pos"] = [p + delta.mean(axis=0) for p in world.get("views_pos", [])]
     world["plant_shift"] = delta.mean(axis=0)
     lock_feet(sk, world, fps)
 

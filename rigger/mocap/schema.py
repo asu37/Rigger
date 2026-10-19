@@ -10,7 +10,8 @@
     valid     (F,) a person was found in the frame
     contacts  (F,2) left / right foot on the floor
     face      (F,C) expression weights 0..1, names in meta["face"] (ARKit names)
-    camera    f, cx, cy (pixels), W (camera->world rotation), cam_pos (world)
+    camera    f, cx, cy (pixels), W (camera->world rotation), cam_pos (world); camera2_* the same for
+              the second camera of a two-camera solve
     kp2d, scores  (F,133,2), (F,133): the raw COCO-WholeBody keypoints, kept for
               re-solving with other settings and for checking the result
 """
@@ -22,7 +23,7 @@ import numpy as np
 FORMAT = "rigger-mcap"
 VERSION = 1
 ARRAYS = ("root_t", "root_q", "local_q", "valid", "contacts", "face", "camera_W", "camera_pos", "camera_K",
-          "kp2d", "scores", "reproj")
+          "kp2d", "scores", "reproj", "camera2_W", "camera2_pos", "camera2_K", "depth")
 
 
 def save(path, meta, skeleton, arrays):

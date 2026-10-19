@@ -138,6 +138,98 @@ arrays = solver.pack(sk, world)
 arrays["camera_K"] = np.array(cam)
 arrays["kp2d"], arrays["scores"] = kp.astype(np.float32), sc.astype(np.float32)
 
+# -- two cameras ---------------------------------------------------------------
+from rigger.mocap import multiview  # noqa: E402
+ang = np.radians(-70)
+R2 = np.array(((np.cos(ang), 0, np.sin(ang)), (0, 1, 0), (-np.sin(ang), 0, np.cos(ang))))
+centre = np.array((0.0, 0.1, 3.6))
+t2 = np.array((0.0, 0.0, 3.6)) - R2 @ centre
+kp2 = np.zeros_like(kp)
+sc2 = np.zeros_like(sc)
+for idx, name in skeleton.kp_sites().items():
+    if name in S:
+        kp2[:, idx] = solver.project(S[name] @ R2.T + t2, cam) + rng.normal(scale=1.0, size=(F, 2))
+        sc2[:, idx] = 0.9
+sol2, views, _kps, info, _cam = multiview.solve(sk, kp, sc, cam, kp2, sc2, cam, fps, {"auto_focal": False})
+ang_err = np.degrees(np.arccos(np.clip((np.trace(views[0][1].T @ R2) - 1) / 2, -1, 1)))
+check(ang_err < 2.0 and info["method_epipolar"] == 1.0, f"second camera calibrated from the person ({ang_err:.2f} deg off)")
+base_err = abs(np.linalg.norm(views[0][2]) - np.linalg.norm(t2)) / np.linalg.norm(t2)
+check(base_err < 0.05, f"camera distance from bone lengths ({base_err * 100:.1f}% off)")
+_G3, P3, _S3 = solver.pose_points(sk, sol2["R"], sol2["t"], sol2["theta"])
+err2 = pa_error(P3[:, body_j], P[:, body_j])
+check(err2.mean() < err.mean() * 0.8, f"two cameras beat one ({err2.mean() * 100:.1f} vs {err.mean() * 100:.1f} cm)")
+al_kp, al_sc = multiview.align(kp2, sc2, fps, fps * 2, F, offset=0.0)
+check(np.allclose(al_kp[10], kp2[20]) and np.allclose(al_kp[0], kp2[0]), "second video resampled onto the first's frames")
+al_kp, al_sc = multiview.align(kp2, sc2, fps, fps, F, offset=0.5)
+check(np.allclose(al_kp[0], kp2[12]) and al_sc[-1].max() == 0, "time offset applied, frames past the end left empty")
+
+import wave  # noqa: E402
+tmp_audio = tempfile.mkdtemp()
+rate = 8000
+noise = np.random.default_rng(3).normal(size=rate * 6)
+clap = np.zeros(rate * 6)
+for at in (1.0, 2.6, 4.1):   # three claps over a quiet hum
+    clap[int(at * rate):int(at * rate) + 400] = 6.0
+signal = 0.05 * noise + clap * np.sign(noise)
+lag = int(0.75 * rate)       # the second recording started 0.75 s earlier, so the same clap comes 0.75 s later
+for name, sig in (("a.wav", signal), ("b.wav", np.concatenate([0.05 * noise[:lag], signal])[:len(signal)])):
+    with wave.open(os.path.join(tmp_audio, name), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes((np.clip(sig / 8, -1, 1) * 32000).astype(np.int16).tobytes())
+off = multiview.audio_offset(os.path.join(tmp_audio, "a.wav"), os.path.join(tmp_audio, "b.wav"))
+check(off is not None and abs(off - 0.75) < 0.02, f"time offset found from the sound ({off})")
+
+# -- FreeMoCap import ------------------------------------------------------------
+from rigger.mocap import freemocap  # noqa: E402
+import csv  # noqa: E402
+fm_dir = os.path.join(tempfile.mkdtemp(), "session", "output_data")
+os.makedirs(fm_dir)
+site_of = skeleton.kp_sites()
+turn = skeleton.rotvec_to_matrix(np.array((0.3, -0.2, 1.1)))   # FreeMoCap world: any orientation, millimetres
+world_pts = {}
+for name_mp, k in freemocap.BODY_TO_COCO.items():
+    world_pts[name_mp] = S[site_of[k]] @ turn.T * 1000 + np.array((250.0, -80.0, 40.0))
+with open(os.path.join(fm_dir, "mediapipe_body_3d_xyz.csv"), "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow([f"body_{n}_{a}" for n in freemocap.BODY for a in "xyz"])
+    for f in range(F):
+        w.writerow([world_pts[n][f, i] if n in world_pts else "" for n in freemocap.BODY for i in range(3)])
+for side, L in (("left", "L"), ("right", "R")):
+    with open(os.path.join(fm_dir, f"mediapipe_{side}_hand_3d_xyz.csv"), "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow([f"{side}_hand_{n}_{a}" for n in freemocap.HAND for a in "xyz"])
+        hand = []
+        for j in range(21):
+            nm = site_of[freemocap.HAND_BASE[side] + j]
+            hand.append(S[nm] @ turn.T * 1000 + np.array((250.0, -80.0, 40.0)))
+        for f in range(F):
+            w.writerow([hand[j][f, i] for j in range(21) for i in range(3)])
+data = freemocap.load(os.path.join(fm_dir, "mediapipe_body_3d_xyz.csv"))
+check(data["body"].shape == (F, 33, 3) and data["left"].shape == (F, 21, 3), "FreeMoCap CSVs read (body and hands)")
+meta_fm, arr_fm = freemocap.solve(sk, os.path.dirname(fm_dir), fps=fps)
+Gfm = bake.world_rotations(sk.parents, arr_fm["local_q"], arr_fm["root_q"])
+Pfm = np.zeros_like(P)
+for j, pj in enumerate(sk.parents):
+    Pfm[:, j] = arr_fm["root_t"] if pj < 0 else Pfm[:, pj] + Gfm[:, pj] @ (sk.rest[j] - sk.rest[pj])
+err_fm = pa_error(Pfm[:, body_j], P[:, body_j])
+check(err_fm.mean() < 0.015, f"FreeMoCap motion recovered ({err_fm.mean() * 100:.1f} cm after alignment)")
+up_fm = Pfm[:, sk.index("head")] - Pfm[:, sk.index("pelvis")]
+check(np.mean(up_fm[:, 2] / np.linalg.norm(up_fm, axis=1)) > 0.9, "FreeMoCap world turned upright (Z up)")
+fm2 = os.path.join(tempfile.mkdtemp(), "output_data")      # FreeMoCap 2.x: long format
+os.makedirs(fm2)
+with open(os.path.join(fm2, "mediapipe_body_3d_xyz.csv"), "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow(["frame", "keypoint", "x", "y", "z"])
+    for f in range(F):
+        for n in freemocap.BODY:
+            p_ = world_pts.get(n)
+            w.writerow([f, f"body_{n}"] + ([p_[f, 0], p_[f, 1], p_[f, 2]] if p_ is not None else ["", "", ""]))
+data2 = freemocap.load(fm2)
+check(np.allclose(data2["body"], data["body"], equal_nan=True) and data2["left"] is None,
+      "FreeMoCap 2.x long-format CSV read the same")
+
 # -- motion file ---------------------------------------------------------------
 path = os.path.join(tempfile.mkdtemp(), "clip.mcap")
 meta = {"fps": fps, "frames": F, "image_size": [W_img, H_img], "face": []}
